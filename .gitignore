@@ -1,0 +1,19 @@
+# Build outputs
+recv_stack
+sender
+*.o
+*.out
+core
+core.*
+
+# Experiment data / received files
+*.bin
+recv_*.bin
+
+# Local caches
+.cache/
+
+# Editor/runtime noise
+.DS_Store
+*.swp
+*.swo

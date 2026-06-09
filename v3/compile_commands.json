@@ -1,0 +1,17 @@
+[
+  {
+    "directory": "/root/homeworeOs/v3",
+    "command": "cc -O3 -Wall -I/usr/include/dpdk -include rte_config.h -march=corei7 -mrtm -I/usr/include/libnl3 -c recv_stack.c",
+    "file": "/root/homeworeOs/v3/recv_stack.c"
+  },
+  {
+    "directory": "/root/homeworeOs/v3",
+    "command": "g++ -O2 -std=c++17 -Wall -Wextra -c sender.cpp",
+    "file": "/root/homeworeOs/v3/sender.cpp"
+  },
+  {
+    "directory": "/root/homeworeOs/v3",
+    "command": "cc -I/usr/include/dpdk -include rte_config.h -I/usr/include/libnl3 -c cproto.h",
+    "file": "/root/homeworeOs/v3/cproto.h"
+  }
+]

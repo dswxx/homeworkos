@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "/root/homeworeOs/v1",
+    "file": "/root/homeworeOs/v1/recv_stack.c",
+    "command": "/usr/bin/cc -O3 -Wall -I/usr/include/dpdk -include rte_config.h -march=corei7 -mrtm -I/usr/include/libnl3 -c /root/homeworeOs/v1/recv_stack.c -o /tmp/recv_stack_v1.o"
+  }
+]
