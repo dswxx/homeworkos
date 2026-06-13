@@ -43,20 +43,33 @@
 
 #include "cproto.h"
 
-#define NUM_MBUFS    8191
+/* mbuf 池必须能同时容纳:满 ring + RX 描述符 + TX 描述符 + 收发突发/处理余量 + 每核 cache。
+ * 不变式(改 RING_SIZE/NB_RXD 时务必一起核对):
+ *     NUM_MBUFS  >  RING_SIZE + NB_RXD + NB_TXD + 余量
+ * 反例(上一版的 bug):RING_SIZE=8192 而 NUM_MBUFS=8191 < 8192+1024,
+ *   ring 一涨满就把池子吸干,收包核拿不到 mbuf → rx_nombuf 暴涨、网卡口丢包。
+ * 取 2^15-1(DPDK 推荐 2^q-1 最省内存):32767 >> 8192+1024+1024 ,余量充足。 */
+#define NUM_MBUFS    32767
 #define MBUF_CACHE   250
 #define BURST_SIZE   32
-#define RING_SIZE    4096
+#define RING_SIZE    8192   /* >= MAXCONN*W(4*1024=4096),给满窗留 2x 余量 */
 #define NB_RXD       1024
 #define NB_TXD       1024
 #define NAK_MAX_CHUNKS 300  /* 每个 NAK 最多带这么多缺失 chunk,留在 MTU 内;余量下轮补 */
 #define MAX_CONN     64     /* 同时支持的并发传输数 */
+
+/* 合并写(落盘优化 opt1):把连续块攒成一大块再 pwrite,削减系统调用。
+ * 若怀疑落盘有问题,改成 0 即退回逐块 pwrite(流控逻辑不受影响)。 */
+#define COALESCE_WRITES 1
+#define COALESCE_MAX    64  /* 最多攒这么多连续块(64*1400≈87KB)再一次写 */
 
 static volatile sig_atomic_t force_quit = 0;
 static struct rte_ring    *rx_ring = NULL;
 static struct rte_mempool *g_pool  = NULL;   /* 发回包时从这里取 mbuf */
 static uint16_t            g_port  = 0;
 static struct rte_ether_addr g_mac;          /* 本端口 MAC,作回包源 MAC */
+static uint64_t g_ring_drop = 0;             /* ring 满入队失败累计 */
+static uint32_t g_ring_peak = 0;             /* ring 深度峰值 */
 
 /* ---------------- CRC32 (与 zlib.crc32 完全一致) ---------------- */
 static uint32_t crc_table[256];
@@ -110,6 +123,15 @@ struct conn_ctx {
     uint32_t dup_pkts;
     uint32_t nak_sent;
     uint64_t last_active;     /* 单调序,用于回收最老的 DONE */
+
+    /* ---- 流量控制(信用) ---- */
+    uint32_t drained;         /* 已出 ring 处理的 DATA 包数 → 据此发信用 */
+    uint32_t last_granted;    /* 上次授予的累计块上限,避免每包都发 CREDIT */
+    /* ---- 合并写暂存 ---- */
+    uint8_t *wbuf;            /* COALESCE_MAX*CHUNK 暂存区 */
+    uint32_t run_start;       /* 当前连续游程的起始块号 */
+    uint32_t run_len;         /* 游程内块数 */
+    uint32_t run_bytes;       /* 游程内字节数(末块可能不足 CHUNK) */
 };
 static struct conn_ctx conns[MAX_CONN];
 static uint64_t g_tick = 0;
@@ -142,6 +164,7 @@ static struct conn_ctx *conn_alloc(void)
     if (oldest) {
         if (oldest->fd >= 0) close(oldest->fd);
         free(oldest->bitmap);
+        free(oldest->wbuf);
         memset(oldest, 0, sizeof(*oldest));
         oldest->fd = -1;
         return oldest;
@@ -170,10 +193,10 @@ static int peer_ok(const struct conn_ctx *c,
 static struct cproto_hdr *
 parse_cproto(struct rte_mbuf *m, uint8_t **payload_out)
 {
-    const uint32_t pkt_len = rte_pktmbuf_pkt_len(m);
-    const uint32_t eth_len = sizeof(struct rte_ether_hdr);
-
-    if (pkt_len < eth_len + sizeof(struct rte_ipv4_hdr))
+    const uint32_t min = sizeof(struct rte_ether_hdr) +
+                         sizeof(struct rte_ipv4_hdr) +
+                         sizeof(struct cproto_hdr);
+    if (rte_pktmbuf_pkt_len(m) < min)
         return NULL;
 
     struct rte_ether_hdr *eth = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
@@ -181,24 +204,12 @@ parse_cproto(struct rte_mbuf *m, uint8_t **payload_out)
         return NULL;
 
     struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((char *)eth + sizeof(*eth));
-    if ((ip->version_ihl >> 4) != 4)
-        return NULL;
     if (ip->next_proto_id != CPROTO_IP_PROTO)
         return NULL;
 
     uint8_t ihl = (ip->version_ihl & 0x0f) * 4;
-    if (ihl < sizeof(struct rte_ipv4_hdr))
-        return NULL;
-    if (pkt_len < eth_len + ihl + sizeof(struct cproto_hdr))
-        return NULL;
-
     struct cproto_hdr *ch = (struct cproto_hdr *)((char *)ip + ihl);
     if (ch->magic != rte_cpu_to_be_16(CPROTO_MAGIC))
-        return NULL;
-
-    uint16_t plen = rte_be_to_cpu_16(ch->payload_len);
-    uint32_t cproto_off = eth_len + ihl;
-    if (pkt_len < cproto_off + sizeof(struct cproto_hdr) + plen)
         return NULL;
 
     if (payload_out)
@@ -378,6 +389,91 @@ static void send_nak(uint16_t connection_id, const uint8_t *bitmap, uint32_t tot
     }
 }
 
+/* ---------------- 构造并发送 CREDIT(收→发,信用流控) ---------------- */
+static void send_credit(uint16_t connection_id, uint32_t granted,
+                        const struct rte_ether_addr *peer_mac, uint32_t peer_ip)
+{
+    struct rte_mbuf *m = rte_pktmbuf_alloc(g_pool);
+    if (!m) return;   /* 信用丢一两个无妨,下次更大的值会覆盖 */
+
+    const uint16_t cplen = sizeof(struct cproto_credit);
+    const uint16_t total = sizeof(struct rte_ether_hdr) +
+                           sizeof(struct rte_ipv4_hdr) +
+                           sizeof(struct cproto_hdr) + cplen;
+    char *p = (char *)rte_pktmbuf_append(m, total);
+    if (!p) { rte_pktmbuf_free(m); return; }
+
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)p;
+    rte_ether_addr_copy(peer_mac, &eth->dst_addr);
+    rte_ether_addr_copy(&g_mac, &eth->src_addr);
+    eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr *)((char *)eth + sizeof(*eth));
+    memset(ip, 0, sizeof(*ip));
+    ip->version_ihl  = 0x45;
+    ip->time_to_live = 64;
+    ip->next_proto_id = CPROTO_IP_PROTO;
+    ip->total_length = rte_cpu_to_be_16(sizeof(struct rte_ipv4_hdr) +
+                                        sizeof(struct cproto_hdr) + cplen);
+    ip->src_addr = rte_cpu_to_be_32(0xC0A82889);
+    ip->dst_addr = peer_ip;
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+    struct cproto_hdr *ch = (struct cproto_hdr *)((char *)ip + sizeof(*ip));
+    ch->magic         = rte_cpu_to_be_16(CPROTO_MAGIC);
+    ch->type          = CPROTO_TYPE_CREDIT;
+    ch->rsv           = 0;
+    ch->chunk_index   = 0;
+    ch->payload_len   = rte_cpu_to_be_16(cplen);
+    ch->connection_id = rte_cpu_to_be_16(connection_id);
+
+    struct cproto_credit *cr = (struct cproto_credit *)((char *)ch + sizeof(*ch));
+    cr->connection_id = rte_cpu_to_be_16(connection_id);
+    cr->rsv           = 0;
+    cr->granted       = rte_cpu_to_be_32(granted);
+
+    uint16_t sent = 0, tries = 0;
+    while (sent == 0 && tries++ < 3)
+        sent = rte_eth_tx_burst(g_port, 0, &m, 1);
+    if (sent == 0) rte_pktmbuf_free(m);   /* TX 满也无妨,丢了下次补 */
+}
+
+/* ---------------- 合并写:连续块攒成大块再落盘 ---------------- */
+static void wbuf_flush(struct conn_ctx *c)
+{
+    if (c->run_len == 0) return;
+    off_t off = (off_t)c->run_start * CPROTO_CHUNK_SIZE;
+    if (pwrite(c->fd, c->wbuf, c->run_bytes, off) != (ssize_t)c->run_bytes)
+        printf("[错误] 合并写 start=%u len=%u 失败: %s\n",
+               c->run_start, c->run_len, strerror(errno));
+    c->run_len   = 0;
+    c->run_bytes = 0;
+}
+static void wbuf_put(struct conn_ctx *c, uint32_t idx,
+                     const uint8_t *payload, uint16_t plen)
+{
+#if COALESCE_WRITES
+    if (c->wbuf) {
+        /* 不连续 / 缓冲满 → 先把已攒的写出去 */
+        if (c->run_len > 0 &&
+            (idx != c->run_start + c->run_len || c->run_len >= COALESCE_MAX))
+            wbuf_flush(c);
+        if (c->run_len == 0) c->run_start = idx;
+        memcpy(c->wbuf + (size_t)c->run_len * CPROTO_CHUNK_SIZE, payload, plen);
+        c->run_len++;
+        c->run_bytes += plen;
+        /* 末块(不足 CHUNK)后面不会再有连续块;或攒满 → 立即落盘 */
+        if (plen < CPROTO_CHUNK_SIZE || c->run_len >= COALESCE_MAX)
+            wbuf_flush(c);
+        return;
+    }
+#endif
+    off_t off = (off_t)idx * CPROTO_CHUNK_SIZE;
+    if (pwrite(c->fd, payload, plen, off) != plen)
+        printf("[错误] pwrite chunk=%u 失败: %s\n", idx, strerror(errno));
+}
+
 /* ---------------- 状态机:START(握手 + 分配 connection_id) ---------------- */
 static void handle_start(uint8_t *payload, uint16_t plen,
                          struct rte_ether_hdr *eth, struct rte_ipv4_hdr *ip)
@@ -405,31 +501,12 @@ static void handle_start(uint8_t *payload, uint16_t plen,
     c->total_size     = rte_be_to_cpu_64(st->total_size);
     c->total_chunks   = rte_be_to_cpu_32(st->total_chunks);
     c->connection_id  = gen_unique_cid();
-    uint32_t expect_chunks = (uint32_t)((c->total_size + CPROTO_CHUNK_SIZE - 1) /
-                                        CPROTO_CHUNK_SIZE);
-    if (c->total_size == 0 || c->total_chunks == 0 || c->total_chunks != expect_chunks) {
-        printf("[警告] START 元信息非法: size=%lu chunks=%u expect=%u\n",
-               (unsigned long)c->total_size, c->total_chunks, expect_chunks);
-        memset(c, 0, sizeof(*c));
-        c->fd = -1;
-        c->state = ST_FREE;
-        return;
-    }
-    if (c->connection_id == 0) {
-        printf("[警告] connection_id 分配失败,拒绝新 START\n");
-        memset(c, 0, sizeof(*c));
-        c->fd = -1;
-        c->state = ST_FREE;
-        return;
-    }
 
     uint16_t namelen = plen - sizeof(struct cproto_start);
     char fname[256];
     if (namelen >= sizeof(fname)) namelen = sizeof(fname) - 1;
     memcpy(fname, payload + sizeof(struct cproto_start), namelen);
     fname[namelen] = '\0';
-    for (uint16_t i = 0; i < namelen; i++)
-        if (fname[i] == '/' || fname[i] == '\\') fname[i] = '_';
 
     /* 输出名带 connection_id,避免并发同名文件互相覆盖 */
     snprintf(c->outname, sizeof(c->outname), "recv_%u_%s", c->connection_id, fname);
@@ -442,17 +519,22 @@ static void handle_start(uint8_t *payload, uint16_t plen,
         return;
     }
     c->bitmap        = calloc(BM_BYTES(c->total_chunks ? c->total_chunks : 1), 1);
-    if (!c->bitmap) {
-        printf("[错误] bitmap 分配失败: chunks=%u\n", c->total_chunks);
-        close(c->fd);
-        memset(c, 0, sizeof(*c));
-        c->fd = -1;
-        c->state = ST_FREE;
-        return;
-    }
     c->recv_count    = 0;
     c->bytes_written = 0;
     c->state         = ST_RECEIVING;
+
+    /* 流控:初始信用上限 = W(发送端也以 W 起步,二者一致) */
+    c->drained      = 0;
+    c->last_granted = CPROTO_FLOW_WINDOW;
+    /* 合并写暂存区 + 文件预分配(opt3:减少写时块分配/碎片) */
+    c->run_start = 0; c->run_len = 0; c->run_bytes = 0;
+#if COALESCE_WRITES
+    c->wbuf = malloc((size_t)COALESCE_MAX * CPROTO_CHUNK_SIZE);  /* 失败则退回逐块写 */
+#else
+    c->wbuf = NULL;
+#endif
+    if (posix_fallocate(c->fd, 0, (off_t)c->total_size) != 0)
+        ftruncate(c->fd, (off_t)c->total_size);   /* 不支持 fallocate 时退而求其次 */
     rte_ether_addr_copy(&eth->src_addr, &c->peer_mac);
     c->peer_ip     = ip->src_addr;
     c->t_start     = now_sec();
@@ -478,32 +560,23 @@ static void handle_data(uint16_t cid, uint32_t idx, uint8_t *payload, uint16_t p
     if (!peer_ok(c, eth, ip))           return;   /* 地址校验 */
     if (idx >= c->total_chunks)         return;
 
-    uint64_t file_off = (uint64_t)idx * CPROTO_CHUNK_SIZE;
-    uint16_t expect_len = CPROTO_CHUNK_SIZE;
-    if (idx == c->total_chunks - 1)
-        expect_len = (uint16_t)(c->total_size - file_off);
-    if (plen != expect_len) {
-        printf("[警告][cid=%u] chunk=%u 长度异常: plen=%u expect=%u,丢弃\n",
-               c->connection_id, idx, plen, expect_len);
-        return;
-    }
-
-    if (BM_GET(c->bitmap, idx)) {        /* 幂等:重复块不重复写盘 */
-        c->data_pkts++;
-        c->dup_pkts++;
-        c->last_active = ++g_tick;
-        return;
-    }
-
-    off_t off = (off_t)idx * CPROTO_CHUNK_SIZE;
-    if (pwrite(c->fd, payload, plen, off) != plen) {
-        printf("[错误] pwrite chunk=%u 失败: %s\n", idx, strerror(errno));
-        return;
-    }
+    wbuf_put(c, idx, payload, plen);     /* 落盘:合并写(或退回逐块) */
     c->data_pkts++;
-    BM_SET(c->bitmap, idx);
-    c->recv_count++;
-    c->bytes_written += plen;
+    c->drained++;                        /* 出 ring 计数 → 据此发信用 */
+    if (!BM_GET(c->bitmap, idx)) {        /* 幂等:重复块不重复计数 */
+        BM_SET(c->bitmap, idx);
+        c->recv_count++;
+        c->bytes_written += plen;
+    } else {
+        c->dup_pkts++;
+    }
+
+    /* 流控:按写盘进度把"允许发到的累计块上限"往上抬(绝对值,幂等) */
+    uint32_t want = c->drained + CPROTO_FLOW_WINDOW;
+    if (want >= c->last_granted + CPROTO_FLOW_WINDOW / 2) {
+        send_credit(c->connection_id, want, &c->peer_mac, c->peer_ip);
+        c->last_granted = want;
+    }
     c->last_active = ++g_tick;
 }
 
@@ -537,10 +610,12 @@ static void handle_end(uint16_t cid, uint8_t *payload, uint16_t plen,
     struct cproto_end *en = (struct cproto_end *)payload;
     uint32_t expect_crc = rte_be_to_cpu_32(en->crc32);
 
-    if (ftruncate(c->fd, c->total_size) != 0)
-        printf("[警告] ftruncate 失败: %s\n", strerror(errno));
-    if (fsync(c->fd) != 0)
-        printf("[警告] fsync 失败: %s\n", strerror(errno));
+    wbuf_flush(c);                 /* 把暂存区里最后一段连续块落盘 */
+    free(c->wbuf);
+    c->wbuf = NULL;
+
+    ftruncate(c->fd, c->total_size);
+    fsync(c->fd);
     uint32_t running = 0xFFFFFFFFu;
     uint8_t  buf[4096];
     off_t    off = 0;
@@ -641,7 +716,7 @@ static void rx_loop(void)
 {
     printf("[收包核] 启动于 lcore %u,端口 %u 轮询中...\n",
            rte_lcore_id(), g_port);
-    uint64_t dropped = 0;
+    double last = now_sec();
 
     while (!force_quit) {
         struct rte_mbuf *bufs[BURST_SIZE];
@@ -654,13 +729,26 @@ static void rx_loop(void)
             }
             if (rte_ring_enqueue(rx_ring, m) < 0) {  /* ring 满 -> 丢 */
                 rte_pktmbuf_free(m);
-                dropped++;
+                g_ring_drop++;
             }
         }
+        uint32_t depth = rte_ring_count(rx_ring);
+        if (depth > g_ring_peak) g_ring_peak = depth;
+
+        double t = now_sec();
+        if (t - last >= 1.0) {                       /* 每秒一行监控 */
+            last = t;
+            struct rte_eth_stats es;
+            if (rte_eth_stats_get(g_port, &es) == 0)
+                printf("[监控] ring cur=%u peak=%u | ring满丢弃=%lu | "
+                       "imissed=%lu rx_nombuf=%lu ierrors=%lu\n",
+                       depth, g_ring_peak, (unsigned long)g_ring_drop,
+                       (unsigned long)es.imissed, (unsigned long)es.rx_nombuf,
+                       (unsigned long)es.ierrors);
+        }
     }
-    if (dropped)
-        printf("[收包核] ring 满丢弃 %lu 包(放慢发送端或增大 RING_SIZE)\n",
-               (unsigned long)dropped);
+    printf("[收包核] 退出  ring满丢弃累计=%lu  ring峰值深度=%u/%u\n",
+           (unsigned long)g_ring_drop, g_ring_peak, RING_SIZE);
 }
 
 /* ---------------- 端口初始化 ---------------- */

@@ -11,7 +11,7 @@
 //  与接收端共用 cproto.h。单线程:开环模型,SO_RCVTIMEO + recv 即可。
 //
 //  编译:  g++ -O2 -std=c++17 -o sender sender.cpp     (与 cproto.h 同目录)
-//  用法:  sudo ./sender <文件> [丢弃的data-chunk] [丢弃START次数]
+//  用法:  sudo ./sender <文件> [丢弃的data-chunk] [丢弃START次数] [限速MB/s]
 // =======================================================================
 #include <cstdint>
 #include <cstdio>
@@ -64,6 +64,10 @@ static const int    MAX_HS       = 6;
 static const double RESP_TIMEOUT = 3.0;
 static const int    MAX_ROUNDS   = 12;
 static const int    BATCH        = 64;
+
+// 信用流控:发到上限就等票。窗口 W 与接收端共用 CPROTO_FLOW_WINDOW。
+static const double CREDIT_WAIT      = 0.5;  // 每次阻塞等票最多 0.5s
+static const int    CREDIT_MAX_STALL = 20;   // 连续约 10s 无票 → 兜底转 END/NAK,防死锁
 
 // ---------------- 小工具 ----------------
 static double now_sec() {
@@ -121,6 +125,7 @@ public:
     RawSocket& operator=(const RawSocket&) = delete;
     int     send_batch(mmsghdr* m, unsigned n) { return ::sendmmsg(fd_, m, n, 0); }
     ssize_t recv(void* b, size_t n)            { return ::recv(fd_, b, n, 0); }
+    ssize_t recv_nb(void* b, size_t n)         { return ::recv(fd_, b, n, MSG_DONTWAIT); }
 };
 
 // ---------------- RAII:只读 mmap 文件 ----------------
@@ -159,6 +164,7 @@ struct Reply {
     uint16_t connection_id = 0;   // START_ACK:服务端分配的 id
     uint8_t  status        = 0;   // END_ACK
     uint32_t recv_chunks   = 0;   // END_ACK
+    uint32_t granted       = 0;   // CREDIT:允许发到的累计块上限
     std::vector<uint32_t> chunks; // NAK:缺失 chunk_index 列表
 };
 
@@ -172,6 +178,7 @@ class Sender {
     uint64_t       client_cid_;     // 本端自选的连接 id(握手配对)
     uint32_t       crc_;
     uint16_t       conn_id_ = 0;    // 接收端分配的 connection_id
+    uint32_t       credit_ceiling_ = CPROTO_FLOW_WINDOW;  // 允许发到的累计块上限
 
     uint8_t  txbuf_[BATCH][1600];
     iovec    iov_[BATCH];
@@ -183,6 +190,8 @@ class Sender {
     uint64_t retx_total_ = 0;
     int      nak_rounds_ = 0;
     int      hs_attempts_= 0;
+    double   rate_bps_   = 0.0;   // 限速(字节/秒);0 = 不限速
+    double   pace_t0_    = 0.0;   // 限速计时起点
 
     void setup_batch() {
         memset(msgs_, 0, sizeof(msgs_));
@@ -209,6 +218,17 @@ class Sender {
             break;  // 仅其它错误才放弃这批
         }
         nbatch_ = 0;
+
+        // 可选限速:按"平均速率不超过 rate_bps_"注入等待。
+        // 这是最原始的一种主动节流 —— 用来验证"把发送端压到瓶颈以下,并发能否稳过"。
+        if (rate_bps_ > 0.0) {
+            double elapsed = now_sec() - pace_t0_;
+            double allowed = rate_bps_ * elapsed;
+            if (static_cast<double>(bytes_) > allowed) {
+                double ahead_s = (static_cast<double>(bytes_) - allowed) / rate_bps_;
+                if (ahead_s > 0) usleep(static_cast<useconds_t>(ahead_s * 1e6));
+            }
+        }
     }
 
     void send_pkt(uint8_t type, uint32_t chunk_index, uint16_t cid,
@@ -314,12 +334,18 @@ class Sender {
             }
             return true;
         }
+        case CPROTO_TYPE_CREDIT: {
+            if (plen < sizeof(cproto_credit)) return false;
+            auto* cr = reinterpret_cast<const cproto_credit*>(pl);
+            r.granted = ntohl(cr->granted);
+            return true;
+        }
         default:
             return false;
         }
     }
 
-    bool wait_reply(double timeout_s, Reply& out) {
+    bool wait_reply(double timeout_s, Reply& out, bool accept_credit = false) {
         double deadline = now_sec() + timeout_s;
         uint8_t buf[2048];
         while (now_sec() < deadline) {
@@ -328,15 +354,35 @@ class Sender {
             if (!parse_reply(buf, n, out)) continue;
             // 只接受属于本连接的回包(并发时两个 sender 同 MAC,会收到对方的回包):
             //   · START_ACK 此时 conn_id_ 尚未分配,用 client_cid 配对
-            //   · END_ACK/NAK 用 connection_id 配对
+            //   · 其余用 connection_id 配对
             if (out.type == CPROTO_TYPE_START_ACK) {
                 if (out.client_cid == client_cid_) return true;
             } else if (conn_id_ != 0 && out.cid == conn_id_) {
-                return true;
+                if (out.type == CPROTO_TYPE_CREDIT) {
+                    if (out.granted > credit_ceiling_) credit_ceiling_ = out.granted;
+                    if (accept_credit) return true;
+                    // 否则吸收掉(已抬升上限),继续等真正的 END_ACK/NAK
+                } else {
+                    return true;
+                }
             }
             // 不属于本连接 → 忽略,继续等到 deadline
         }
         return false;
+    }
+
+    // 非阻塞地把已到的 CREDIT 收干净,抬升上限(猛灌阶段每批顺手调用)
+    void drain_credit_nb() {
+        uint8_t buf[2048];
+        Reply r;
+        for (;;) {
+            ssize_t n = sock_.recv_nb(buf, sizeof(buf));
+            if (n <= 0) break;
+            if (!parse_reply(buf, n, r)) continue;
+            if (r.type == CPROTO_TYPE_CREDIT && conn_id_ != 0 && r.cid == conn_id_ &&
+                r.granted > credit_ceiling_)
+                credit_ceiling_ = r.granted;
+        }
     }
 
     bool handshake(int drop_starts) {
@@ -373,7 +419,7 @@ class Sender {
     }
 
 public:
-    Sender(const char* iface, const FileMap& fm, std::string fname)
+    Sender(const char* iface, const FileMap& fm, std::string fname, double rate_mbps)
         : sock_(iface),
           file_(fm.data()),
           total_size_(fm.size()),
@@ -384,12 +430,15 @@ public:
         std::mt19937_64 gen(((uint64_t)rd() << 32) ^ rd());
         client_cid_ = gen();
         crc_        = crc32_compute(file_, total_size_);
+        rate_bps_   = rate_mbps > 0.0 ? rate_mbps * 1e6 : 0.0;
         setup_batch();
     }
 
     void banner(const std::set<uint32_t>& drop_first, int drop_starts) const {
         printf("       大小 %zu 字节 | %u 块 | crc32=0x%08x | client_cid=0x%016llx\n",
                total_size_, total_chunks_, crc_, (unsigned long long)client_cid_);
+        printf("       [流控] 信用窗口 W=%u 块(接收端按写盘进度发 CREDIT)\n",
+               (unsigned)CPROTO_FLOW_WINDOW);
         if (!drop_first.empty()) {
             printf("       [测试] 首发故意丢弃 chunk [");
             bool first = true;
@@ -398,10 +447,13 @@ public:
         }
         if (drop_starts > 0)
             printf("       [测试] 故意丢弃前 %d 个 START\n", drop_starts);
+        if (rate_bps_ > 0.0)
+            printf("       [限速] 目标平均速率 %.1f MB/s\n", rate_bps_ / 1e6);
     }
 
     void run(const std::set<uint32_t>& drop_first, int drop_starts) {
-        double t0 = now_sec();
+        pace_t0_ = now_sec();
+        double t0 = pace_t0_;
 
         if (!handshake(drop_starts)) {
             printf("[结果] ✗ 握手失败,放弃\n");
@@ -409,11 +461,24 @@ public:
         }
 
         uint32_t sent = 0;
+        int credit_stall = 0;
         for (uint32_t idx = 0; idx < total_chunks_; idx++) {
             if (drop_first.count(idx)) continue;
+            // 信用门控:发到上限就停下,等接收端按写盘进度发更高的票
+            while (idx >= credit_ceiling_) {
+                Reply r;
+                if (wait_reply(CREDIT_WAIT, r, /*accept_credit=*/true)) {
+                    credit_stall = 0;            // ceiling 已在 wait_reply 内抬升
+                } else if (++credit_stall >= CREDIT_MAX_STALL) {
+                    printf("[流控] 久候信用未果,提前转入 END/NAK 收尾\n");
+                    goto blast_done;
+                }
+            }
             send_data(idx, conn_id_);
             sent++;
+            if ((sent & (BATCH - 1)) == 0) drain_credit_nb();  // 每批顺手收票
         }
+    blast_done:
         send_end();
         flush();
         printf("[完成] DATA %u/%u + END 已发出\n", sent, total_chunks_);
@@ -459,7 +524,7 @@ public:
 // ---------------- main ----------------
 int main(int argc, char** argv) {
     if (argc < 2) {
-        fprintf(stderr, "用法: sudo %s <文件> [丢弃的data-chunk] [丢弃START次数]\n", argv[0]);
+        fprintf(stderr, "用法: sudo %s <文件> [丢弃的data-chunk] [丢弃START次数] [限速MB/s]\n", argv[0]);
         return 1;
     }
     const char* path = argv[1];
@@ -473,6 +538,7 @@ int main(int argc, char** argv) {
         free(s);
     }
     int drop_starts = (argc >= 4) ? atoi(argv[3]) : 0;
+    double rate_mbps = (argc >= 5) ? atof(argv[4]) : 0.0;   // 0 = 不限速
 
     crc32_init();
     try {
@@ -481,7 +547,7 @@ int main(int argc, char** argv) {
         std::string fn(path);
         auto pos = fn.find_last_of('/');
         if (pos != std::string::npos) fn = fn.substr(pos + 1);
-        Sender s(IFACE, fm, fn);
+        Sender s(IFACE, fm, fn, rate_mbps);
         printf("[发送] %s\n", path);
         s.banner(drop_first, drop_starts);
         s.run(drop_first, drop_starts);

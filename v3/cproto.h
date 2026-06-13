@@ -27,6 +27,7 @@ enum {
     CPROTO_TYPE_START_ACK = 3,  /* 收→发  握手确认           */
     CPROTO_TYPE_NAK       = 4,  /* 收→发  请求重传缺块        */
     CPROTO_TYPE_END_ACK   = 5,  /* 收→发  关闭确认           */
+    CPROTO_TYPE_CREDIT    = 6,  /* 收→发  流控信用(可发到的累计块上限) */
 };
 
 /* END_ACK 状态 */
@@ -78,8 +79,24 @@ struct cproto_nak {
     /* 后面紧跟 count 个 uint32 缺失 chunk_index */
 } __attribute__((__packed__));
 
+/* CREDIT 包(收→发):QUIC 式信用流控。
+ *   granted = "本连接允许发送的累计块上限(绝对值)"。
+ *   发送端保证 已发块数 <= granted;接收端按写盘进度把 granted 往上抬。
+ *   绝对值=幂等:丢一两个 CREDIT 无妨,后一个更大的值直接覆盖。 */
+struct cproto_credit {
+    uint16_t connection_id;  /* 目标连接(发送端据此过滤,只认自己的) */
+    uint16_t rsv;            /* 对齐,填 0 */
+    uint32_t granted;        /* 允许发送到的累计块上限(绝对块数) */
+} __attribute__((__packed__));
+
 /* ---- 参数 ---- */
 #define CPROTO_CHUNK_SIZE  1400
 /* 帧长: 14(eth) + 20(ip) + 12(cproto_hdr) + 1400 = 1446 <= 1514,留足余量 */
+
+/* ---- 流量控制参数(收发两端共享) ---- */
+#define CPROTO_FLOW_WINDOW   1024u  /* 单连接窗口 W:最多 W 个块"在途未落盘" */
+#define CPROTO_FLOW_MAXCONN  4u     /* 设计并发上限;需保证 W*MAXCONN <= RING_SIZE */
+/* 不变式: 任一时刻 ring 内某连接的块数 <= (已发 - 已落盘) <= W,
+ *         故所有连接合计 <= MAXCONN*W <= RING_SIZE,ring 永不溢出。 */
 
 #endif /* CPROTO_H */
